@@ -1,59 +1,42 @@
-from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
-from database import engine, Base, get_db
-from models import User
-from schemas import UserCreate, Token
-from auth import get_password_hash, verify_password, create_access_token
-from dependencies import get_current_user
-from datetime import timedelta
+from fastapi import FastAPI, Request
+from database import engine, Base
+from routers import users, quizzes
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from slowapi.errors import RateLimitExceeded
+from starlette.responses import JSONResponse
 
 app = FastAPI()
+
 Base.metadata.create_all(bind=engine)
 
-
-from fastapi import Response
-
-print("Hello")
-
-@app.get("/", response_model=dict)
-def dummy():
-    print("Hello")
-    return {"msg": "Hello FastAPI"}
-
-print("Hello")
-@app.post("/signup", response_model=Token)
-def signup(user: UserCreate, db: Session = Depends(get_db)):
-    hashed_password = get_password_hash(user.password)
-    db_user = User(username=user.username, password=hashed_password)
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-
-    access_token = create_access_token({"sub": db_user.username}, timedelta(minutes=60))
-    return {"access_token": access_token, "token_type": "bearer"}
+# Setup rate limiter
+limiter = Limiter(key_func=get_remote_address, default_limits=["100/second"])
+app.state.limiter = limiter
 
 
-@app.post("/login", response_model=Token)
-def login(
-    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
-):
-    user = db.query(User).filter(User.username == form_data.username).first()
-    if not user or not verify_password(form_data.password, user.password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
-        )
-    access_token = create_access_token({"sub": user.username}, timedelta(minutes=60))
-    return {"access_token": access_token, "token_type": "bearer"}
+async def custom_rate_limit_handler(request, exc: RateLimitExceeded):
+    return JSONResponse(
+        {"error": "Rate limit exceeded", "details": str(exc.detail)},
+        status_code=429,
+    )
 
 
-@app.post("/token", response_model=Token)
-def token_endpoint(
-    form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)
-):
-    return login(form_data, db)
+app.add_exception_handler(RateLimitExceeded, custom_rate_limit_handler)
+# Add SlowAPI middleware for rate limiting
+app.add_middleware(SlowAPIMiddleware)
+
+# 🚀 **Ensure tables are created at startup**
+Base.metadata.create_all(bind=engine)
+
+# Include routers
+app.include_router(users.router)
+app.include_router(quizzes.router)
 
 
-@app.get("/test")
-def test_route(current_user: str = Depends(get_current_user)):
-    return {"message": f"Hello, {current_user}! You are authenticated."}
+@app.get("/")
+@limiter.limit("10/second")
+def home(request: Request):  # ✅ Added request parameter
+    return {"message": "Welcome to the Quiz API"}
